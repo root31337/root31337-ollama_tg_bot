@@ -2,6 +2,17 @@ import logging
 import subprocess
 import asyncio
 import signal
+import os
+from typing import Dict, Any, List, Optional, Tuple
+import json
+import time
+from datetime import datetime
+from functools import wraps
+import re
+import statistics
+from dataclasses import dataclass
+from enum import Enum
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,39 +24,9 @@ from telegram.ext import (
 )
 import ollama
 from ollama import ResponseError
-import os
-from typing import Dict, Any, List, Optional, Tuple
-import json
-import time
-from datetime import datetime
-from functools import wraps
 
-# Конфигурация
-CONFIG = {
-    'TOKEN': 'YOU_TOKENS,
-    'MAX_CONTEXT_MESSAGES': 8,
-    'MAX_CONTEXT_LENGTH': 3000,
-    'MODEL_TIMEOUT': 740,
-    'DEFAULT_MODEL': 'llama3',
-    'BACKUP_INTERVAL': 300,
-    'MAX_MESSAGE_LENGTH': 3900,  # 4000 с запасом
-    'LOG_LEVEL': 'INFO',
-    'ADMIN_IDS': [ADM_IDS],
-    'RATE_LIMIT': 5,
-    'TYPING_DELAY': 0.5,
-     'MODEL_OPTIONS': {
-        'temperature': 0.7,
-        'num_ctx': 2048,
-        'top_k': 40,
-        'top_p': 0.9
-    },
-    'MODEL_PRIORITY': {
-        'llama3': 1,
-        'mistral': 2,
-        'codellama': 3
-    },
-    'MODEL_HEALTH_CHECK': True
-}
+# Импортируем конфигурацию
+from config import CONFIG
 
 # Настройка логирования
 def setup_logging():
@@ -68,6 +49,96 @@ rate_limit_counters: Dict[int, Tuple[int, float]] = {}
 model_info_cache: Dict[str, Dict] = {}
 active_requests: Dict[int, asyncio.Task] = {}
 shutdown_event = asyncio.Event()
+benchmark_results: Dict[str, List[Dict]] = {}
+
+# Классы для бенчмарка
+class BenchmarkTask:
+    def __init__(self, id: str, name: str, prompt: str, expected_answer: str):
+        self.id = id
+        self.name = name
+        self.prompt = prompt
+        self.expected_answer = expected_answer.lower()
+    
+    def evaluate(self, response: str) -> Tuple[float, str]:
+        """Оценивает ответ модели от 0 до 1"""
+        response_lower = response.lower()
+        
+        # Простая проверка на наличие ожидаемого ответа
+        if self.expected_answer in response_lower:
+            return 1.0, "✅ Полный правильный ответ"
+        
+        # Для математических задач пытаемся извлечь число
+        if self.id == 'math_problem':
+            numbers = re.findall(r'\d+', response)
+            if numbers:
+                try:
+                    last_number = int(numbers[-1])
+                    if last_number == 6:
+                        return 1.0, "✅ Правильный числовой ответ"
+                    else:
+                        return 0.5, f"⚠️ Число найдено, но неверное: {last_number}"
+                except:
+                    pass
+        
+        # Для логических задач
+        if self.id == 'logic_puzzle':
+            if 'одинаков' in response_lower or 'равн' in response_lower or 'same' in response_lower:
+                return 1.0, "✅ Правильный логический вывод"
+        
+        # Для перевода
+        if self.id == 'translation':
+            if 'red car' in response_lower or 'the red car' in response_lower:
+                return 1.0, "✅ Правильный перевод"
+            elif 'red' in response_lower and 'car' in response_lower:
+                return 0.8, "✅ Основные слова переведены правильно"
+        
+        # Для генерации кода
+        if self.id == 'code_generation':
+            if 'def factorial' in response_lower:
+                return 1.0, "✅ Правильное определение функции"
+            elif 'factorial' in response_lower and ('def ' in response_lower or 'function' in response_lower):
+                return 0.7, "⚠️ Функция найдена, но могут быть ошибки"
+        
+        # Для суммаризации
+        if self.id == 'summarization':
+            keywords = ['диагностик', 'лечени', 'анализ', 'прогноз', 'робот', 'хирург']
+            found_keywords = sum(1 for kw in keywords if kw in response_lower)
+            if found_keywords >= 2:
+                return 0.8, "✅ Основные преимущества упомянуты"
+        
+        return 0.0, "❌ Ответ не соответствует ожидаемому"
+
+@dataclass
+class BenchmarkResult:
+    model: str
+    task_id: str
+    task_name: str
+    score: float
+    response_time: float
+    tokens_generated: int
+    tokens_per_second: float
+    evaluation: str
+    raw_response: str
+    timestamp: float
+    
+    def to_dict(self):
+        return {
+            'model': self.model,
+            'task_id': self.task_id,
+            'task_name': self.task_name,
+            'score': self.score,
+            'response_time': self.response_time,
+            'tokens_generated': self.tokens_generated,
+            'tokens_per_second': self.tokens_per_second,
+            'evaluation': self.evaluation,
+            'timestamp': self.timestamp
+        }
+
+class BenchmarkStatus(Enum):
+    NOT_STARTED = "not_started"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 # Декораторы
 def rate_limit_check(func):
@@ -130,6 +201,7 @@ def setup_directories():
     os.makedirs('backups', exist_ok=True)
     os.makedirs('logs', exist_ok=True)
     os.makedirs('temp', exist_ok=True)
+    os.makedirs('benchmarks', exist_ok=True)
 
 async def backup_data():
     """Асинхронное создание резервных копий"""
@@ -149,6 +221,13 @@ async def backup_data():
             logger.info("Резервное копирование данных завершено")
     except Exception as e:
         logger.error(f"Ошибка резервного копирования: {e}")
+
+async def backup_task(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическое резервное копирование"""
+    if shutdown_event.is_set():
+        return
+    
+    await backup_data()
 
 async def load_backup():
     """Загрузка последней резервной копии"""
@@ -209,7 +288,9 @@ async def get_available_models(refresh: bool = False) -> List[str]:
                 model_info_cache[model] = {
                     'name': model, 
                     'last_used': None,
-                    'usage_count': 0
+                    'usage_count': 0,
+                    'benchmark_score': 0.0,
+                    'benchmark_tested': False
                 }
         
         return sorted(
@@ -279,10 +360,13 @@ def initialize_user(user_id: int):
                 'models_used': {},
                 'last_active': time.time(),
                 'total_tokens': 0,
-                'total_requests': 0
+                'total_requests': 0,
+                'benchmarks_run': 0
             },
             'is_admin': user_id in CONFIG['ADMIN_IDS'],
-            'created_at': time.time()
+            'created_at': time.time(),
+            'benchmark_status': BenchmarkStatus.NOT_STARTED.value,
+            'current_benchmark': None
         }
     
     if user_id not in context_memory:
@@ -300,6 +384,243 @@ async def send_long_message(update: Update, text: str, parse_mode: str = None):
             await update.message.reply_text(part, parse_mode=parse_mode)
         else:
             await update.effective_chat.send_message(part, parse_mode=parse_mode)
+
+# Функции бенчмарка
+async def run_benchmark_task(model: str, task: BenchmarkTask) -> Optional[BenchmarkResult]:
+    """Запуск одного тестового задания для модели"""
+    try:
+        start_time = time.time()
+        
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ollama.chat,
+                model=model,
+                messages=[{'role': 'user', 'content': task.prompt}],
+                options={
+                    **CONFIG['MODEL_OPTIONS'],
+                    'temperature': CONFIG['BENCHMARK_TEMPERATURE'],
+                    'num_predict': CONFIG['BENCHMARK_MAX_TOKENS']
+                }
+            ),
+            timeout=CONFIG['BENCHMARK_TIMEOUT']
+        )
+        
+        end_time = time.time()
+        response_time = end_time - start_time
+        answer = response['message']['content']
+        
+        # Получаем статистику токенов
+        eval_count = response.get('eval_count', 0)
+        tokens_per_second = eval_count / response_time if response_time > 0 else 0
+        
+        # Оцениваем ответ
+        score, evaluation = task.evaluate(answer)
+        
+        result = BenchmarkResult(
+            model=model,
+            task_id=task.id,
+            task_name=task.name,
+            score=score,
+            response_time=response_time,
+            tokens_generated=eval_count,
+            tokens_per_second=tokens_per_second,
+            evaluation=evaluation,
+            raw_response=answer[:200] + "..." if len(answer) > 200 else answer,
+            timestamp=time.time()
+        )
+        
+        logger.info(f"Бенчмарк: {model} - {task.name} - Оценка: {score:.2f} - Время: {response_time:.2f}с")
+        
+        return result
+        
+    except asyncio.TimeoutError:
+        logger.warning(f"Таймаут бенчмарка для модели {model} на задаче {task.name}")
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка бенчмарка для модели {model}: {e}")
+        return None
+
+async def run_full_benchmark(models: List[str], user_id: int):
+    """Запуск полного бенчмарка для списка моделей"""
+    user_data[user_id]['benchmark_status'] = BenchmarkStatus.RUNNING.value
+    
+    tasks = [BenchmarkTask(**task) for task in CONFIG['BENCHMARK_TASKS']]
+    results = {}
+    
+    total_tasks = len(models) * len(tasks)
+    completed_tasks = 0
+    
+    for model in models:
+        model_results = []
+        
+        # Проверяем доступность модели
+        if not await get_model_info(model):
+            logger.warning(f"Модель {model} недоступна для бенчмарка")
+            continue
+        
+        for task in tasks:
+            if shutdown_event.is_set():
+                break
+            
+            result = await run_benchmark_task(model, task)
+            if result:
+                model_results.append(result)
+                
+                # Сохраняем результат
+                if model not in benchmark_results:
+                    benchmark_results[model] = []
+                benchmark_results[model].append(result.to_dict())
+            
+            completed_tasks += 1
+            progress = (completed_tasks / total_tasks) * 100
+            
+            # Обновляем статус
+            user_data[user_id]['current_benchmark'] = {
+                'progress': progress,
+                'current_model': model,
+                'current_task': task.name,
+                'completed_tasks': completed_tasks,
+                'total_tasks': total_tasks
+            }
+        
+        if model_results:
+            avg_score = statistics.mean([r.score for r in model_results])
+            avg_time = statistics.mean([r.response_time for r in model_results])
+            avg_tps = statistics.mean([r.tokens_per_second for r in model_results])
+            
+            results[model] = {
+                'avg_score': avg_score,
+                'avg_time': avg_time,
+                'avg_tps': avg_tps,
+                'results': model_results
+            }
+            
+            # Обновляем информацию о модели
+            if model in model_info_cache:
+                model_info_cache[model]['benchmark_score'] = avg_score
+                model_info_cache[model]['benchmark_tested'] = True
+    
+    # Сохраняем результаты в файл
+    if results:
+        await save_benchmark_results(results, user_id)
+    
+    user_data[user_id]['benchmark_status'] = BenchmarkStatus.COMPLETED.value
+    user_data[user_id]['stats']['benchmarks_run'] += 1
+    
+    return results
+
+async def save_benchmark_results(results: Dict, user_id: int):
+    """Сохранение результатов бенчмарка в файл"""
+    try:
+        timestamp = int(time.time())
+        filename = f'benchmarks/benchmark_{user_id}_{timestamp}.json'
+        
+        data = {
+            'timestamp': timestamp,
+            'user_id': user_id,
+            'results': {},
+            'summary': {}
+        }
+        
+        for model, model_data in results.items():
+            data['results'][model] = {
+                'avg_score': model_data['avg_score'],
+                'avg_time': model_data['avg_time'],
+                'avg_tps': model_data['avg_tps'],
+                'task_results': [r.to_dict() for r in model_data['results']]
+            }
+        
+        # Создаем сводку
+        sorted_models = sorted(results.items(), key=lambda x: x[1]['avg_score'], reverse=True)
+        data['summary'] = {
+            'top_model': sorted_models[0][0] if sorted_models else None,
+            'ranking': [{'model': m, 'score': d['avg_score']} for m, d in sorted_models],
+            'total_models': len(results),
+            'timestamp': timestamp
+        }
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Результаты бенчмарка сохранены в {filename}")
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения результатов бенчмарка: {e}")
+        return None
+
+def format_benchmark_results(results: Dict) -> str:
+    """Форматирование результатов бенчмарка для отображения"""
+    if not results:
+        return "❌ Нет результатов для отображения"
+    
+    lines = ["📊 *Результаты бенчмарка моделей*\n"]
+    
+    sorted_models = sorted(results.items(), key=lambda x: x[1]['avg_score'], reverse=True)
+    
+    for i, (model, data) in enumerate(sorted_models):
+        score_stars = "⭐" * int(data['avg_score'] * 5)
+        lines.append(f"\n*{i+1}. {model}*")
+        lines.append(f"   Оценка: {data['avg_score']:.2f}/1.0 {score_stars}")
+        lines.append(f"   Среднее время: {data['avg_time']:.2f}с")
+        lines.append(f"   Токенов/сек: {data['avg_tps']:.1f}")
+        
+        # Детали по задачам
+        lines.append(f"   *Детали:*")
+        for task_result in data['results']:
+            status = "✅" if task_result.score >= 0.7 else "⚠️" if task_result.score >= 0.3 else "❌"
+            lines.append(f"   {status} {task_result.task_name}: {task_result.score:.1f} ({task_result.response_time:.1f}с)")
+    
+    # Сводная таблица
+    lines.append("\n*📈 Сводная таблица:*")
+    lines.append("```")
+    lines.append(f"{'Модель':<20} {'Оценка':<8} {'Время':<8} {'T/s':<8}")
+    lines.append("-" * 50)
+    for model, data in sorted_models:
+        lines.append(f"{model:<20} {data['avg_score']:.2f}     {data['avg_time']:.2f}с    {data['avg_tps']:.1f}")
+    lines.append("```")
+    
+    return "\n".join(lines)
+
+async def get_model_leaderboard() -> str:
+    """Получение таблицы лидеров моделей"""
+    tested_models = {m: d for m, d in model_info_cache.items() if d.get('benchmark_tested', False)}
+    
+    if not tested_models:
+        return "📊 *Таблица лидеров*\n\nПока нет протестированных моделей. Запустите бенчмарк!"
+    
+    sorted_models = sorted(
+        tested_models.items(),
+        key=lambda x: x[1].get('benchmark_score', 0),
+        reverse=True
+    )
+    
+    lines = ["🏆 *Таблица лидеров моделей*\n"]
+    lines.append("```")
+    lines.append(f"{'Место':<6} {'Модель':<25} {'Оценка':<8} {'Тестов':<8} {'Использований':<12}")
+    lines.append("-" * 65)
+    
+    for i, (model, data) in enumerate(sorted_models[:10]):
+        score = data.get('benchmark_score', 0)
+        tests = len([r for r in benchmark_results.get(model, []) if r.get('model') == model])
+        uses = data.get('usage_count', 0)
+        
+        medal = ""
+        if i == 0:
+            medal = "🥇 "
+        elif i == 1:
+            medal = "🥈 "
+        elif i == 2:
+            medal = "🥉 "
+        
+        lines.append(f"{medal}{i+1:<3} {model:<25} {score:.2f}      {tests:<8} {uses:<12}")
+    
+    lines.append("```")
+    
+    if len(sorted_models) > 10:
+        lines.append(f"\n... и еще {len(sorted_models) - 10} моделей")
+    
+    return "\n".join(lines)
 
 # Обработчики команд
 @handle_errors
@@ -322,6 +643,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_data[user_id]['is_admin']:
         keyboard.append([InlineKeyboardButton("🛠 Админ-панель", callback_data='admin_panel')])
+        keyboard.append([InlineKeyboardButton("🏆 Бенчмарк", callback_data='benchmark_menu')])
     
     await update.message.reply_text(
         "🤖 *Добро пожаловать в Ollama Telegram Bot!*\n\n"
@@ -329,6 +651,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
+
+@handle_errors
+@rate_limit_check
+async def benchmark_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для запуска бенчмарка"""
+    user_id = update.effective_user.id
+    initialize_user(user_id)
+    
+    if not user_data[user_id]['is_admin']:
+        await update.message.reply_text("🚫 Эта команда доступна только администраторам")
+        return
+    
+    await show_benchmark_menu(update.callback_query)
+
+@handle_errors
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для отображения таблицы лидеров"""
+    user_id = update.effective_user.id
+    initialize_user(user_id)
+    
+    leaderboard = await get_model_leaderboard()
+    await update.message.reply_text(leaderboard, parse_mode='Markdown')
 
 @handle_errors
 @rate_limit_check
@@ -536,7 +880,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     initialize_user(user_id)
     
-    if query.data == 'toggle_context':
+    # Обработка кнопок бенчмарка
+    if query.data == 'benchmark_menu':
+        await show_benchmark_menu(query)
+    
+    elif query.data == 'run_full_benchmark':
+        await run_full_benchmark_handler(update, context)
+    
+    elif query.data == 'show_leaderboard':
+        await show_leaderboard_handler(update, context)
+    
+    elif query.data == 'show_benchmark_tasks':
+        await show_benchmark_tasks_handler(update, context)
+    
+    elif query.data == 'test_single_model':
+        await test_single_model_handler(update, context)
+    
+    elif query.data.startswith('benchmark_model_'):
+        await benchmark_model_handler(update, context)
+    
+    # ... остальные обработчики кнопок из предыдущей версии
+    elif query.data == 'toggle_context':
         user_data[user_id]['preferences']['save_context'] = not user_data[user_id]['preferences']['save_context']
         status = "✅ Вкл" if user_data[user_id]['preferences']['save_context'] else "❌ Выкл"
         await show_main_menu(query, f"🧠 Контекст: {status}")
@@ -621,6 +985,7 @@ async def show_main_menu(query, text: str = None):
     
     if user_data[user_id]['is_admin']:
         keyboard.append([InlineKeyboardButton("🛠 Админ-панель", callback_data='admin_panel')])
+        keyboard.append([InlineKeyboardButton("🏆 Бенчмарк", callback_data='benchmark_menu')])
     
     try:
         await query.edit_message_text(
@@ -748,29 +1113,33 @@ async def show_admin_panel(query):
     total_tokens = sum(u['stats'].get('total_tokens', 0) for u in user_data.values())
     total_models = len(model_info_cache)
     
-    # Топ моделей
-    top_models = sorted(
-        model_info_cache.items(),
-        key=lambda x: x[1].get('usage_count', 0),
+    # Топ моделей из бенчмарка
+    tested_models = {m: d for m, d in model_info_cache.items() if d.get('benchmark_tested', False)}
+    top_benchmark_models = sorted(
+        tested_models.items(),
+        key=lambda x: x[1].get('benchmark_score', 0),
         reverse=True
-    )[:5]
+    )[:3]
     
-    models_info = "\n".join(
-        f"• {model}: {info.get('usage_count', 0)} запросов, "
-        f"посл. исп.: {datetime.fromtimestamp(info.get('last_used', 0)).strftime('%d.%m %H:%M') if info.get('last_used') else 'никогда'}"
-        for model, info in top_models
-    )
+    benchmark_info = ""
+    if top_benchmark_models:
+        benchmark_info = "\n*🏆 Топ моделей по бенчмарку:*\n"
+        for model, info in top_benchmark_models:
+            score = info.get('benchmark_score', 0)
+            benchmark_info += f"• {model}: {score:.2f}/1.0\n"
     
     admin_text = (
         "🛠 *Админ-панель*\n\n"
         f"• Всего пользователей: {total_users}\n"
         f"• Активных за сутки: {active_users}\n"
         f"• Загружено моделей: {total_models}\n"
-        f"• Использовано токенов: {total_tokens}\n\n"
-        f"*Топ моделей:*\n{models_info}"
+        f"• Использовано токенов: {total_tokens}\n"
+        f"• Протестировано моделей: {len(tested_models)}\n"
+        f"{benchmark_info}"
     )
     
     keyboard = [
+        [InlineKeyboardButton("🏆 Бенчмарк моделей", callback_data='benchmark_menu')],
         [InlineKeyboardButton("🔄 Обновить данные", callback_data='admin_panel')],
         [InlineKeyboardButton("💾 Создать бэкап", callback_data='force_backup')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
@@ -782,12 +1151,270 @@ async def show_admin_panel(query):
         parse_mode='Markdown'
     )
 
-async def backup_task(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическое резервное копирование"""
-    if shutdown_event.is_set():
+# Новые обработчики для бенчмарка
+@handle_errors
+async def benchmark_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик меню бенчмарка"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    await show_benchmark_menu(query)
+
+async def show_benchmark_menu(query, text: str = None):
+    """Отображение меню бенчмарка"""
+    user_id = query.from_user.id
+    
+    keyboard = [
+        [InlineKeyboardButton("🚀 Запустить полный бенчмарк", callback_data='run_full_benchmark')],
+        [InlineKeyboardButton("📊 Показать лидерборд", callback_data='show_leaderboard')],
+        [InlineKeyboardButton("📋 Список тестовых заданий", callback_data='show_benchmark_tasks')],
+        [InlineKeyboardButton("🧪 Протестировать одну модель", callback_data='test_single_model')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_panel')]
+    ]
+    
+    await query.edit_message_text(
+        text or "🏆 *Меню бенчмаркинга*\n\nЗдесь вы можете тестировать и сравнивать производительность разных моделей.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@handle_errors
+async def run_full_benchmark_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик запуска полного бенчмарка"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    if user_data[user_id]['benchmark_status'] == BenchmarkStatus.RUNNING.value:
+        await query.answer("⚠️ Бенчмарк уже запущен", show_alert=True)
         return
     
-    await backup_data()
+    # Получаем список доступных моделей
+    models = await get_available_models(refresh=True)
+    if not models:
+        await query.edit_message_text(
+            "❌ Нет доступных моделей для тестирования.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data='benchmark_menu')]
+            ])
+        )
+        return
+    
+    await query.edit_message_text(
+        f"🚀 *Запуск полного бенчмарка*\n\n"
+        f"Будут протестированы {len(models)} моделей:\n"
+        + "\n".join(f"• {model}" for model in models[:10]) +
+        (f"\n... и еще {len(models) - 10} моделей" if len(models) > 10 else "") +
+        f"\n\nВсего заданий: {len(CONFIG['BENCHMARK_TASKS'])}"
+        f"\nОжидаемое время: ~{len(models) * len(CONFIG['BENCHMARK_TASKS']) * 15} секунд"
+        f"\n\n*Начинаю тестирование...*",
+        parse_mode='Markdown'
+    )
+    
+    # Запускаем бенчмарк в фоне
+    asyncio.create_task(run_benchmark_and_report(models, user_id, query))
+
+async def run_benchmark_and_report(models: List[str], user_id: int, query):
+    """Запуск бенчмарка и отправка отчетов"""
+    try:
+        results = await run_full_benchmark(models, user_id)
+        
+        if results:
+            # Формируем отчет
+            report = format_benchmark_results(results)
+            
+            # Сохраняем детальный отчет в файл
+            timestamp = int(time.time())
+            report_filename = f'benchmarks/report_{user_id}_{timestamp}.txt'
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                f.write(report)
+            
+            # Отправляем сводный отчет
+            summary_lines = report.split('\n')[:50]  # Первые 50 строк
+            summary = '\n'.join(summary_lines)
+            
+            if len(report) > 4000:
+                parts = split_long_message(report, 4000)
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        await query.edit_message_text(
+                            f"📊 *Отчет о бенчмарке* (часть {i+1}/{len(parts)})\n\n{part}",
+                            parse_mode='Markdown'
+                        )
+                    else:
+                        await query.effective_chat.send_message(
+                            f"📊 *Отчет о бенчмарке* (часть {i+1}/{len(parts)})\n\n{part}",
+                            parse_mode='Markdown'
+                        )
+            else:
+                await query.edit_message_text(
+                    f"📊 *Отчет о бенчмарке*\n\n{report}",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🏆 Лидерборд", callback_data='show_leaderboard')],
+                        [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+                    ])
+                )
+        else:
+            await query.edit_message_text(
+                "❌ Бенчмарк завершился без результатов. Возможно, все модели недоступны.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+                ])
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении бенчмарка: {e}", exc_info=True)
+        await query.edit_message_text(
+            f"❌ Ошибка при выполнении бенчмарка: {str(e)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+            ])
+        )
+
+@handle_errors
+async def show_leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отображения лидерборда"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    leaderboard = await get_model_leaderboard()
+    
+    await query.edit_message_text(
+        leaderboard,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data='show_leaderboard')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+        ])
+    )
+
+@handle_errors
+async def show_benchmark_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отображения тестовых заданий"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    tasks_text = "📋 *Тестовые задания бенчмарка*\n\n"
+    for i, task in enumerate(CONFIG['BENCHMARK_TASKS']):
+        tasks_text += f"*{i+1}. {task['name']}*\n"
+        tasks_text += f"   Запрос: `{task['prompt']}`\n"
+        tasks_text += f"   Ожидаемый ответ: {task['expected_answer']}\n\n"
+    
+    await query.edit_message_text(
+        tasks_text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+        ])
+    )
+
+@handle_errors
+async def test_single_model_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик тестирования одной модели"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    models = await get_available_models()
+    if not models:
+        await query.edit_message_text(
+            "❌ Нет доступных моделей.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+            ])
+        )
+        return
+    
+    # Создаем кнопки для выбора модели
+    buttons = []
+    for model in models[:20]:  # Ограничиваем 20 моделями
+        model_info = model_info_cache.get(model, {})
+        score = model_info.get('benchmark_score', 0)
+        score_text = f" ({score:.2f})" if score > 0 else ""
+        buttons.append(
+            InlineKeyboardButton(f"{model}{score_text}", callback_data=f"benchmark_model_{model}")
+        )
+    
+    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')])
+    
+    await query.edit_message_text(
+        "🧪 *Тестирование одной модели*\n\nВыберите модель для тестирования:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@handle_errors
+async def benchmark_model_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик тестирования конкретной модели"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    initialize_user(user_id)
+    
+    model_name = query.data.replace('benchmark_model_', '')
+    
+    await query.edit_message_text(
+        f"🧪 *Тестирование модели: {model_name}*\n\nНачинаю тестирование...",
+        parse_mode='Markdown'
+    )
+    
+    # Запускаем тест для одной модели
+    tasks = [BenchmarkTask(**task) for task in CONFIG['BENCHMARK_TASKS']]
+    results = []
+    
+    for task in tasks:
+        result = await run_benchmark_task(model_name, task)
+        if result:
+            results.append(result)
+    
+    if results:
+        avg_score = statistics.mean([r.score for r in results])
+        avg_time = statistics.mean([r.response_time for r in results])
+        avg_tps = statistics.mean([r.tokens_per_second for r in results])
+        
+        report = f"📊 *Результаты тестирования: {model_name}*\n\n"
+        report += f"Средняя оценка: *{avg_score:.2f}/1.0*\n"
+        report += f"Среднее время ответа: *{avg_time:.2f}с*\n"
+        report += f"Скорость генерации: *{avg_tps:.1f} токенов/сек*\n\n"
+        report += "*Детали по задачам:*\n"
+        
+        for result in results:
+            status = "✅" if result.score >= 0.7 else "⚠️" if result.score >= 0.3 else "❌"
+            report += f"{status} {result.task_name}: {result.score:.1f} ({result.response_time:.1f}с)\n"
+            report += f"   Оценка: {result.evaluation}\n"
+            report += f"   Ответ: _{result.raw_response}_\n\n"
+        
+        await query.edit_message_text(
+            report,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏆 Лидерборд", callback_data='show_leaderboard')],
+                [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+            ])
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ Не удалось протестировать модель {model_name}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 В меню", callback_data='benchmark_menu')]
+            ])
+        )
 
 async def post_init(application):
     """Пост-инициализация"""
@@ -833,7 +1460,7 @@ async def main():
     setup_directories()
     
     try:
-        # Загрузка бэкапов
+        # Загружаем бэкапы
         await load_backup()
         
         application = ApplicationBuilder() \
@@ -847,6 +1474,8 @@ async def main():
         application.add_handler(CommandHandler('model', lambda u, c: show_models_menu(u.callback_query)))
         application.add_handler(CommandHandler('stats', lambda u, c: show_stats_menu(u.callback_query)))
         application.add_handler(CommandHandler('settings', lambda u, c: show_settings_menu(u.callback_query)))
+        application.add_handler(CommandHandler('benchmark', benchmark_command))
+        application.add_handler(CommandHandler('leaderboard', leaderboard_command))
         
         # Обработчики сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

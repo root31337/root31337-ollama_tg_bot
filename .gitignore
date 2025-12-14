@@ -1,0 +1,27 @@
+# Секретные файлы
+secrets.py
+*.env
+.env.local
+
+# Питон
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи
+bot.log
+*.log
+
+# Бэкапы
+backups/
+temp/
+benchmarks/
